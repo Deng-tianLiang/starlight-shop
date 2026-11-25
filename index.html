@@ -3127,14 +3127,29 @@
 
       /* ==================== 1. Web Audio 精致手工音效 ==================== */
       let audioCtx = null;
+      let sfxBus = null;
       let audioUnlocked = false;
       let audioSilentPrimed = false;
+      let pendingSfx = [];
       let soundOn = true;
       try {
         const savedSnd = localStorage.getItem('baobao_v7_sound');
         if (savedSnd === '0') soundOn = false;
       } catch (e) {}
       const PENTA = [523.25, 587.33, 659.25, 783.99, 880.0, 1046.5, 1174.66];
+
+      function flushPendingSfx() {
+        if (!soundOn || !audioCtx || audioCtx.state !== 'running' || !pendingSfx.length) return;
+        const nowMs = Date.now();
+        const queue = pendingSfx;
+        pendingSfx = [];
+        const dest = sfxBus || audioCtx.destination;
+        for (let i = 0; i < queue.length; i++) {
+          if (nowMs - queue[i].ts <= 450) {
+            try { queue[i].fn(audioCtx, dest); } catch (e) {}
+          }
+        }
+      }
 
       function ensureAudio(fromGesture) {
         if (!soundOn) return null;
@@ -3143,18 +3158,38 @@
           const AC = window.AudioContext || window.webkitAudioContext;
           if (!AC) return null;
           audioCtx = new AC();
+          // 统一交互音效母线：手机扬声器清晰可听，压限器防止连点/和弦破音
+          sfxBus = audioCtx.createGain();
+          sfxBus.gain.value = 3.4;
+          if (typeof audioCtx.createDynamicsCompressor === 'function') {
+            const comp = audioCtx.createDynamicsCompressor();
+            comp.threshold.value = -12;
+            comp.knee.value = 18;
+            comp.ratio.value = 6;
+            comp.attack.value = 0.003;
+            comp.release.value = 0.14;
+            sfxBus.connect(comp);
+            comp.connect(audioCtx.destination);
+          } else {
+            sfxBus.connect(audioCtx.destination);
+          }
+          audioCtx.onstatechange = function () {
+            if (audioCtx && audioCtx.state === 'running') flushPendingSfx();
+          };
         }
         if (audioCtx.state !== 'running') {
-          try { audioCtx.resume().catch(function () {}); } catch (e) {}
+          try {
+            audioCtx.resume().then(flushPendingSfx).catch(function () {});
+          } catch (e) {}
         }
         if (fromGesture && !audioSilentPrimed) {
-          audioSilentPrimed = true;
           try {
             const b = audioCtx.createBuffer(1, 1, 22050);
             const s = audioCtx.createBufferSource();
             s.buffer = b;
             s.connect(audioCtx.destination);
             s.start(0);
+            if (audioCtx.state === 'running') audioSilentPrimed = true;
           } catch (e) {}
         }
         return audioCtx;
@@ -3164,70 +3199,99 @@
         audioUnlocked = true;
         if (soundOn) ensureAudio(true);
       }
-      ['pointerdown', 'touchstart', 'keydown'].forEach(function (ev) {
+      ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'click', 'keydown'].forEach(function (ev) {
         window.addEventListener(ev, unlockAudioGesture, { capture: true, passive: true });
       });
       document.addEventListener('WeixinJSBridgeReady', unlockAudioGesture, false);
 
-      function pluck(freq, dur, type, gainVal, delay) {
+      function scheduleSfx(fn) {
         const ctx = ensureAudio(false);
-        if (!ctx || ctx.state !== 'running') return;
-        const t = ctx.currentTime + (delay || 0);
-        const osc = ctx.createOscillator();
-        const g = ctx.createGain();
-        osc.type = type || 'sine';
-        osc.frequency.setValueAtTime(freq, t);
-        g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(gainVal || 0.06, t + 0.01);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + (dur || 0.14));
-        osc.connect(g); g.connect(ctx.destination);
-        osc.start(t); osc.stop(t + (dur || 0.14) + 0.02);
+        if (!ctx) return;
+        const dest = sfxBus || ctx.destination;
+        if (ctx.state === 'running') {
+          try { fn(ctx, dest); } catch (e) {}
+          return;
+        }
+        pendingSfx.push({ fn: fn, ts: Date.now() });
+        if (pendingSfx.length > 4) pendingSfx.shift();
+        try { ctx.resume().then(flushPendingSfx).catch(function () {}); } catch (e) {}
       }
 
-      function sfxSwitch() { pluck(523.25, 0.08, 'triangle', 0.045, 0); pluck(783.99, 0.11, 'sine', 0.04, 0.04); }
-      function sfxBlip() { pluck(660 + Math.random() * 140, 0.04, 'sine', 0.022, 0); }
-      function sfxPop() { pluck(740 + Math.random() * 220, 0.07, 'sine', 0.065, 0); }
-      function sfxCoin() { pluck(1318.5, 0.12, 'sine', 0.055, 0); pluck(1760.0, 0.24, 'sine', 0.05, 0.06); }
-      function sfxRatchet() { pluck(320 + Math.random() * 80, 0.032, 'square', 0.026, 0); }
-      function sfxDrop() { pluck(260, 0.08, 'triangle', 0.08, 0); pluck(420, 0.06, 'sine', 0.05, 0.08); }
+      function pluck(freq, dur, type, gainVal, delay) {
+        scheduleSfx(function (ctx, dest) {
+          const t = ctx.currentTime + (delay || 0);
+          const d = Math.max(0.035, dur || 0.14);
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          osc.type = type || 'sine';
+          osc.frequency.setValueAtTime(freq, t);
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.exponentialRampToValueAtTime(Math.max(0.002, gainVal || 0.06), t + 0.008);
+          g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+          osc.connect(g); g.connect(dest);
+          osc.onended = function () { try { osc.disconnect(); g.disconnect(); } catch (e) {} };
+          osc.start(t); osc.stop(t + d + 0.02);
+        });
+      }
+
+      function sfxSwitch() { pluck(523.25, 0.09, 'triangle', 0.055, 0); pluck(783.99, 0.13, 'sine', 0.05, 0.04); }
+      function sfxBlip() { pluck(660 + Math.random() * 140, 0.045, 'sine', 0.026, 0); }
+      function sfxPop() { pluck(740 + Math.random() * 220, 0.085, 'sine', 0.075, 0); }
+      function sfxCoin() { pluck(1318.5, 0.13, 'sine', 0.065, 0); pluck(1760.0, 0.25, 'sine', 0.06, 0.06); }
+      function sfxRatchet() { pluck(320 + Math.random() * 80, 0.038, 'square', 0.032, 0); }
+      function sfxDrop() { pluck(260, 0.09, 'triangle', 0.09, 0); pluck(420, 0.07, 'sine', 0.06, 0.08); }
       function sfxCrack() {
-        pluck(587.33, 0.14, 'triangle', 0.07, 0);
-        pluck(880.0, 0.18, 'sine', 0.065, 0.04);
-        pluck(1318.5, 0.26, 'sine', 0.055, 0.09);
+        pluck(587.33, 0.15, 'triangle', 0.08, 0);
+        pluck(880.0, 0.19, 'sine', 0.075, 0.04);
+        pluck(1318.5, 0.28, 'sine', 0.065, 0.09);
       }
       function sfxWood() {
-        const ctx = ensureAudio(false);
-        if (!ctx || ctx.state !== 'running') return;
-        const t = ctx.currentTime;
-        const osc = ctx.createOscillator();
-        const g = ctx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(590, t);
-        osc.frequency.exponentialRampToValueAtTime(320, t + 0.085);
-        g.gain.setValueAtTime(0.11, t);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
-        osc.connect(g); g.connect(ctx.destination);
-        osc.start(t); osc.stop(t + 0.12);
+        scheduleSfx(function (ctx, dest) {
+          const t = ctx.currentTime;
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(580, t);
+          osc.frequency.exponentialRampToValueAtTime(300, t + 0.09);
+          g.gain.setValueAtTime(0.11, t);
+          g.gain.exponentialRampToValueAtTime(0.0001, t + 0.13);
+          osc.connect(g); g.connect(dest);
+          osc.onended = function () { try { osc.disconnect(); g.disconnect(); } catch (e) {} };
+          osc.start(t); osc.stop(t + 0.14);
+
+          // 清脆木槌轻叩泛音
+          const knock = ctx.createOscillator();
+          const kg = ctx.createGain();
+          knock.type = 'sine';
+          knock.frequency.setValueAtTime(1180, t);
+          knock.frequency.exponentialRampToValueAtTime(640, t + 0.035);
+          kg.gain.setValueAtTime(0.055, t);
+          kg.gain.exponentialRampToValueAtTime(0.0001, t + 0.045);
+          knock.connect(kg); kg.connect(dest);
+          knock.onended = function () { try { knock.disconnect(); kg.disconnect(); } catch (e) {} };
+          knock.start(t); knock.stop(t + 0.05);
+        });
       }
       function sfxBreak(c) {
         const f = PENTA[Math.min(c, PENTA.length - 1)];
-        pluck(f, 0.14, 'triangle', 0.065, 0);
-        pluck(f * 1.5, 0.12, 'sine', 0.04, 0.03);
+        pluck(f, 0.15, 'triangle', 0.075, 0);
+        pluck(f * 1.5, 0.13, 'sine', 0.05, 0.03);
       }
       function sfxCelebrate() {
-        [523.25, 659.25, 783.99, 1046.5].forEach(function (f, i) { pluck(f, 0.24, 'triangle', 0.065, i * 0.065); });
+        [523.25, 659.25, 783.99, 1046.5].forEach(function (f, i) { pluck(f, 0.25, 'triangle', 0.075, i * 0.065); });
       }
       function sfxMagiBeep(step) {
         const freqs = [587.33, 698.46, 880.0, 1174.66];
-        pluck(freqs[step] || 880, 0.18, 'square', 0.03, 0);
+        pluck(freqs[step] || 880, 0.19, 'square', 0.04, 0);
       }
 
       const soundToggle = document.getElementById('sound-toggle');
       soundToggle.textContent = soundOn ? '🔊' : '🔇';
-      soundToggle.addEventListener('click', function () {
+      soundToggle.addEventListener('click', function (e) {
         soundOn = !soundOn;
         soundToggle.textContent = soundOn ? '🔊' : '🔇';
-        try { localStorage.setItem('baobao_v7_sound', soundOn ? '1' : '0'); } catch (e) {}
+        try { localStorage.setItem('baobao_v7_sound', soundOn ? '1' : '0'); } catch (err) {}
+        spawnTapPop(e.clientX, e.clientY, soundOn ? '🔊 音效已开' : '🔇 已静音');
         if (soundOn) { audioUnlocked = true; ensureAudio(true); sfxSwitch(); }
         else setSleepSound('off');
       });
